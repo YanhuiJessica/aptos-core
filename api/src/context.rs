@@ -33,7 +33,7 @@ use aptos_types::{
     chain_id::ChainId,
     contract_event::EventWithVersion,
     event::EventKey,
-    indexer::db_tailer_reader::IndexerReader,
+    indexer::indexer_db_reader::IndexerReader,
     ledger_info::LedgerInfoWithSignatures,
     on_chain_config::{GasSchedule, GasScheduleV2, OnChainConfig, OnChainExecutionConfig},
     state_store::{

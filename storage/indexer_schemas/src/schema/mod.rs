@@ -15,7 +15,7 @@ use aptos_schemadb::ColumnFamilyName;
 
 pub const DEFAULT_COLUMN_FAMILY_NAME: ColumnFamilyName = "default";
 pub const INDEXER_METADATA_CF_NAME: ColumnFamilyName = "indexer_metadata";
-pub const TAILER_METADATA_CF_NAME: ColumnFamilyName = "tailer_metadata";
+pub const INTERNAL_INDEXER_METADATA_CF_NAME: ColumnFamilyName = "internal_indexer_metadata";
 pub const TABLE_INFO_CF_NAME: ColumnFamilyName = "table_info";
 pub const EVENT_BY_KEY_CF_NAME: ColumnFamilyName = "event_by_key";
 pub const EVENT_BY_VERSION_CF_NAME: ColumnFamilyName = "event_by_version";
@@ -29,10 +29,10 @@ pub fn column_families() -> Vec<ColumnFamilyName> {
     ]
 }
 
-pub fn tailer_column_families() -> Vec<ColumnFamilyName> {
+pub fn internal_indexer_column_families() -> Vec<ColumnFamilyName> {
     vec![
         /* empty cf */ DEFAULT_COLUMN_FAMILY_NAME,
-        TAILER_METADATA_CF_NAME,
+        INTERNAL_INDEXER_METADATA_CF_NAME,
         EVENT_BY_KEY_CF_NAME,
         EVENT_BY_VERSION_CF_NAME,
         TRANSACTION_BY_ACCOUNT_CF_NAME,

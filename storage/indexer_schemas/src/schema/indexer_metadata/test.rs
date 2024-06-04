@@ -15,10 +15,11 @@ proptest! {
     }
 
     #[test]
-    fn test_encode_decode_tailer_metadata(
-        version in any::<Version>(),
+    fn test_encode_decode_internal_indexer_metadata(
+        key in any::<MetadataKey>(),
+        metadata in any::<MetadataValue>(),
     ) {
-        assert_encode_decode::<TailerMetadataSchema>(&version, &());
+        assert_encode_decode::<InternalIndexerMetadataSchema>(&key, &metadata);
     }
 }
 

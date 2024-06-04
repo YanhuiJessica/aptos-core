@@ -25,7 +25,7 @@ use aptos_types::{
     access_path::{AccessPath, Path},
     chain_id::ChainId,
     contract_event::{ContractEvent, EventWithVersion},
-    indexer::db_tailer_reader::IndexerReader,
+    indexer::indexer_db_reader::IndexerReader,
     state_store::{
         state_key::{inner::StateKeyInner, StateKey},
         table::{TableHandle, TableInfo},
@@ -66,19 +66,19 @@ const OBJECT_STRUCT: &IdentStr = ident_str!("Object");
 pub struct MoveConverter<'a, S> {
     inner: AptosValueAnnotator<'a, S>,
     db: Arc<dyn DbReader>,
-    table_info_reader: Option<Arc<dyn IndexerReader>>,
+    indexer_reader: Option<Arc<dyn IndexerReader>>,
 }
 
 impl<'a, S: StateView> MoveConverter<'a, S> {
     pub fn new(
         inner: &'a S,
         db: Arc<dyn DbReader>,
-        table_info_reader: Option<Arc<dyn IndexerReader>>,
+        indexer_reader: Option<Arc<dyn IndexerReader>>,
     ) -> Self {
         Self {
             inner: AptosValueAnnotator::new(inner),
             db,
-            table_info_reader,
+            indexer_reader,
         }
     }
 
@@ -961,9 +961,9 @@ impl<'a, S: StateView> MoveConverter<'a, S> {
     }
 
     fn get_table_info(&self, handle: TableHandle) -> Result<Option<TableInfo>> {
-        if let Some(table_info_reader) = self.table_info_reader.as_ref() {
-            // Attempt to get table_info from the table_info_reader if it exists
-            Ok(table_info_reader.get_table_info(handle)?)
+        if let Some(indexer_reader) = self.indexer_reader.as_ref() {
+            // Attempt to get table_info from the indexer_reader if it exists
+            Ok(indexer_reader.get_table_info(handle)?)
         } else if self.db.indexer_enabled() {
             // Attempt to get table_info from the db if indexer is enabled
             Ok(Some(self.db.get_table_info(handle)?))
@@ -1067,7 +1067,7 @@ pub trait AsConverter<R> {
     fn as_converter(
         &self,
         db: Arc<dyn DbReader>,
-        table_info_reader: Option<Arc<dyn IndexerReader>>,
+        indexer_reader: Option<Arc<dyn IndexerReader>>,
     ) -> MoveConverter<R>;
 }
 
@@ -1075,9 +1075,9 @@ impl<R: StateView> AsConverter<R> for R {
     fn as_converter(
         &self,
         db: Arc<dyn DbReader>,
-        table_info_reader: Option<Arc<dyn IndexerReader>>,
+        indexer_reader: Option<Arc<dyn IndexerReader>>,
     ) -> MoveConverter<R> {
-        MoveConverter::new(self, db, table_info_reader)
+        MoveConverter::new(self, db, indexer_reader)
     }
 }
 

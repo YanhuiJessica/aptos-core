@@ -13,7 +13,7 @@ use aptos_config::config::{ApiConfig, NodeConfig};
 use aptos_logger::info;
 use aptos_mempool::MempoolClientSender;
 use aptos_storage_interface::DbReader;
-use aptos_types::{chain_id::ChainId, indexer::db_tailer_reader::IndexerReader};
+use aptos_types::{chain_id::ChainId, indexer::indexer_db_reader::IndexerReader};
 use poem::{
     handler,
     http::Method,

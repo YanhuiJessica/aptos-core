@@ -18,7 +18,7 @@ use aptos_protos::{
     util::timestamp::FILE_DESCRIPTOR_SET as UTIL_TIMESTAMP_FILE_DESCRIPTOR_SET,
 };
 use aptos_storage_interface::DbReader;
-use aptos_types::{chain_id::ChainId, indexer::db_tailer_reader::IndexerReader};
+use aptos_types::{chain_id::ChainId, indexer::indexer_db_reader::IndexerReader};
 use std::{net::ToSocketAddrs, sync::Arc};
 use tokio::runtime::Runtime;
 use tonic::{codec::CompressionEncoding, transport::Server};

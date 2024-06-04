@@ -4,20 +4,18 @@
 //! This module defines physical storage schema storing metadata for the internal indexer
 //!
 
-use super::TAILER_METADATA_CF_NAME;
+use super::INTERNAL_INDEXER_METADATA_CF_NAME;
 use crate::{
     metadata::{MetadataKey, MetadataValue},
     schema::INDEXER_METADATA_CF_NAME,
-    utils::ensure_slice_len_eq,
 };
 use anyhow::Result;
 use aptos_schemadb::{
-    define_schema,
+    define_pub_schema,
     schema::{KeyCodec, ValueCodec},
 };
-use aptos_types::transaction::Version;
 
-define_schema!(
+define_pub_schema!(
     IndexerMetadataSchema,
     MetadataKey,
     MetadataValue,
@@ -44,9 +42,14 @@ impl ValueCodec<IndexerMetadataSchema> for MetadataValue {
     }
 }
 
-define_schema!(TailerMetadataSchema, Version, (), TAILER_METADATA_CF_NAME);
+define_pub_schema!(
+    InternalIndexerMetadataSchema,
+    MetadataKey,
+    MetadataValue,
+    INTERNAL_INDEXER_METADATA_CF_NAME
+);
 
-impl KeyCodec<TailerMetadataSchema> for Version {
+impl KeyCodec<InternalIndexerMetadataSchema> for MetadataKey {
     fn encode_key(&self) -> Result<Vec<u8>> {
         Ok(bcs::to_bytes(self)?)
     }
@@ -56,14 +59,13 @@ impl KeyCodec<TailerMetadataSchema> for Version {
     }
 }
 
-impl ValueCodec<TailerMetadataSchema> for () {
+impl ValueCodec<InternalIndexerMetadataSchema> for MetadataValue {
     fn encode_value(&self) -> Result<Vec<u8>> {
-        Ok(Vec::new())
+        Ok(bcs::to_bytes(self)?)
     }
 
     fn decode_value(data: &[u8]) -> Result<Self> {
-        ensure_slice_len_eq(data, 0)?;
-        Ok(())
+        Ok(bcs::from_bytes(data)?)
     }
 }
 

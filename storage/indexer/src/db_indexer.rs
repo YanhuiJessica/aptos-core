@@ -1,18 +1,20 @@
 // Copyright (c) Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
+use aptos_config::config::internal_indexer_db_config::InternalIndexerDBConfig;
+use aptos_db_indexer_schemas::{
+    metadata::{MetadataKey, MetadataValue},
     schema::{
         event_by_key::EventByKeySchema, event_by_version::EventByVersionSchema,
-        indexer_metadata::TailerMetadataSchema, transaction_by_account::TransactionByAccountSchema,
+        indexer_metadata::InternalIndexerMetadataSchema,
+        transaction_by_account::TransactionByAccountSchema,
     },
     utils::{
         error_if_too_many_requested, get_first_seq_num_and_limit, AccountTransactionVersionIter,
         MAX_REQUEST_LIMIT,
     },
 };
-use aptos_config::config::index_db_tailer_config::IndexDBTailerConfig;
-use aptos_schemadb::{ReadOptions, SchemaBatch, DB};
+use aptos_schemadb::{SchemaBatch, DB};
 use aptos_storage_interface::{
     db_ensure as ensure, db_other_bail as bail, AptosDbError, DbReader, Result,
 };
@@ -20,62 +22,154 @@ use aptos_types::{
     account_address::AccountAddress,
     contract_event::{ContractEvent, EventWithVersion},
     event::EventKey,
-    indexer::db_tailer_reader::Order,
-    transaction::{AccountTransactionsWithProof, Version},
+    indexer::indexer_db_reader::Order,
+    transaction::{AccountTransactionsWithProof, Transaction, Version},
 };
-use std::sync::Arc;
+use std::{
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
+    thread,
+};
 
-pub struct DBTailer {
-    pub db: Arc<DB>,
-    pub main_db_reader: Arc<dyn DbReader>,
-    batch_size: usize,
+pub struct DBCommitter {
+    db: Arc<DB>,
+    receiver: Receiver<Option<SchemaBatch>>,
 }
 
-impl DBTailer {
-    pub fn new(db: Arc<DB>, db_reader: Arc<dyn DbReader>, config: &IndexDBTailerConfig) -> Self {
+impl DBCommitter {
+    pub fn new(db: Arc<DB>, receiver: Receiver<Option<SchemaBatch>>) -> Self {
+        Self { db, receiver }
+    }
+
+    pub fn run(&self) {
+        loop {
+            let batch_opt = self
+                .receiver
+                .recv()
+                .expect("Failed to receive batch from DB Indexer");
+            if let Some(batch) = batch_opt {
+                self.db
+                    .write_schemas(batch)
+                    .expect("Failed to write batch to indexer db");
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+pub struct DBIndexer {
+    pub db: Arc<DB>,
+    pub main_db_reader: Arc<dyn DbReader>,
+    config: InternalIndexerDBConfig,
+    sender: Sender<Option<SchemaBatch>>,
+    committer_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for DBIndexer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.committer_handle.take() {
+            self.sender
+                .send(None)
+                .expect("Failed to send None to DBIndexer committer");
+            handle
+                .join()
+                .expect("DBIndexer committer thread fails to join");
+        }
+    }
+}
+
+impl DBIndexer {
+    pub fn new(
+        db: Arc<DB>,
+        db_reader: Arc<dyn DbReader>,
+        config: &InternalIndexerDBConfig,
+    ) -> Self {
+        let (sender, reciver) = mpsc::channel();
+
+        let db_clone = db.clone();
+        let committer_handle = thread::spawn(move || {
+            let committer = DBCommitter::new(db, reciver);
+            committer.run();
+        });
+
         Self {
-            db,
+            db: db_clone,
             main_db_reader: db_reader,
-            batch_size: config.batch_size,
+            config: *config,
+            sender,
+            committer_handle: Some(committer_handle),
         }
     }
 
-    pub fn get_persisted_version(&self) -> Version {
+    pub fn get_persisted_version(&self) -> Result<Version> {
         // read the latest key from the db
-        let mut rev_iter_res = self
-            .db
-            .rev_iter::<TailerMetadataSchema>(Default::default())
-            .expect("Cannot create db tailer metadata iterator");
-        rev_iter_res
-            .next()
-            .map(|res| res.map_or(0, |(version, _)| version))
-            .unwrap_or_default()
+        self.db
+            .get::<InternalIndexerMetadataSchema>(&MetadataKey::LatestVersion)?
+            .map_or(Ok(0), |metavalue| Ok(metavalue.expect_version()))
+    }
+
+    pub fn event_enabled(&self) -> bool {
+        self.config.enable_event
+    }
+
+    pub fn transaction_enabled(&self) -> bool {
+        self.config.enable_transaction
+    }
+
+    fn get_internal_db_iter(
+        &self,
+        start_version: Version,
+        num_transactions: u64,
+    ) -> Result<Box<dyn Iterator<Item = Result<(Transaction, Vec<ContractEvent>)>> + '_>> {
+        let txn_iter = self
+            .main_db_reader
+            .get_transaction_iterator(start_version, num_transactions)?;
+        let event_vec_iter = self
+            .main_db_reader
+            .get_events_iterator(start_version, num_transactions)?;
+        let zipped = txn_iter
+            .zip(event_vec_iter)
+            .map(|(txn_res, event_vec_res)| {
+                let txn = txn_res?;
+                let event_vec = event_vec_res?;
+                Ok((txn, event_vec))
+            });
+        Ok(Box::new(zipped)
+            as Box<
+                dyn Iterator<Item = Result<(Transaction, Vec<ContractEvent>)>> + '_,
+            >)
+    }
+
+    fn get_num_of_transactions(&self, version: Version) -> Result<u64> {
+        let highest_version = self.main_db_reader.get_synced_version()?;
+        let num_transaction = if (version + self.config.batch_size as u64) < highest_version {
+            self.config.batch_size as u64
+        } else {
+            highest_version - version
+        };
+        Ok(num_transaction)
     }
 
     pub fn process_a_batch(&self, start_version: Option<Version>) -> Result<Version> {
         let mut version = start_version.unwrap_or(0);
-        let db_iter: Box<
-            dyn Iterator<
-                Item = std::prelude::v1::Result<
-                    (aptos_types::transaction::Transaction, Vec<ContractEvent>),
-                    AptosDbError,
-                >,
-            >,
-        > = self
-            .main_db_reader
-            .get_db_tailor_iter(version, self.batch_size)
-            .expect("Cannot create db tailer iterator");
-        let batch = SchemaBatch::new();
-        db_iter.for_each(|res| {
-            res.map(|(txn, events)| {
-                if let Some(txn) = txn.try_as_signed_user_txn() {
-                    batch
-                        .put::<TransactionByAccountSchema>(
-                            &(txn.sender(), txn.sequence_number()),
-                            &version,
-                        )
-                        .expect("Failed to put txn to db tailer batch");
 
+        let num_transactions = self.get_num_of_transactions(version)?;
+        let mut db_iter = self.get_internal_db_iter(version, num_transactions)?;
+        let batch = SchemaBatch::new();
+        db_iter.try_for_each(|res| {
+            let (txn, events) = res?;
+            if let Some(txn) = txn.try_as_signed_user_txn() {
+                if self.config.enable_transaction {
+                    batch.put::<TransactionByAccountSchema>(
+                        &(txn.sender(), txn.sequence_number()),
+                        &version,
+                    )?;
+                }
+
+                if self.config.enable_event {
                     events.iter().enumerate().for_each(|(idx, event)| {
                         if let ContractEvent::V1(v1) = event {
                             batch
@@ -83,22 +177,27 @@ impl DBTailer {
                                     &(*v1.key(), v1.sequence_number()),
                                     &(version, idx as u64),
                                 )
-                                .expect("Failed to event by key to db tailer batch");
+                                .expect("Failed to put events by key to a batch");
                             batch
                                 .put::<EventByVersionSchema>(
                                     &(*v1.key(), version, v1.sequence_number()),
                                     &(idx as u64),
                                 )
-                                .expect("Failed to event by version to db tailer batch");
+                                .expect("Failed to put events by version to a batch");
                         }
                     });
                 }
-                version += 1;
-            })
-            .expect("Failed to iterate db tailer iterator");
-        });
-        batch.put::<TailerMetadataSchema>(&version, &())?;
-        self.db.write_schemas(batch)?;
+            }
+            version += 1;
+            Ok::<(), AptosDbError>(())
+        })?;
+        batch.put::<InternalIndexerMetadataSchema>(
+            &MetadataKey::LatestVersion,
+            &MetadataValue::Version(version - 1),
+        )?;
+        self.sender
+            .send(Some(batch))
+            .map_err(|e| AptosDbError::Other(e.to_string()))?;
         Ok(version)
     }
 
@@ -109,9 +208,7 @@ impl DBTailer {
         num_versions: u64,
         ledger_version: Version,
     ) -> Result<AccountTransactionVersionIter> {
-        let mut iter = self
-            .db
-            .iter::<TransactionByAccountSchema>(ReadOptions::default())?;
+        let mut iter = self.db.iter::<TransactionByAccountSchema>()?;
         iter.seek(&(address, min_seq_num))?;
         Ok(AccountTransactionVersionIter::new(
             iter,
@@ -128,9 +225,7 @@ impl DBTailer {
         ledger_version: Version,
         event_key: &EventKey,
     ) -> Result<Option<u64>> {
-        let mut iter = self
-            .db
-            .iter::<EventByVersionSchema>(ReadOptions::default())?;
+        let mut iter = self.db.iter::<EventByVersionSchema>()?;
         iter.seek_for_prev(&(*event_key, ledger_version, u64::max_value()))?;
 
         Ok(iter.next().transpose()?.and_then(
@@ -154,7 +249,7 @@ impl DBTailer {
             u64,     // index among events for the same transaction
         )>,
     > {
-        let mut iter = self.db.iter::<EventByKeySchema>(ReadOptions::default())?;
+        let mut iter = self.db.iter::<EventByKeySchema>()?;
         iter.seek(&(*event_key, start_seq_num))?;
 
         let mut result = Vec::new();
@@ -179,11 +274,11 @@ impl DBTailer {
         Ok(result)
     }
 
-    #[cfg(any(test, feature = "test"))]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn get_event_by_key_iter(
         &self,
     ) -> Result<Box<dyn Iterator<Item = (EventKey, u64, u64, u64)> + '_>> {
-        let mut iter = self.db.iter::<EventByKeySchema>(ReadOptions::default())?;
+        let mut iter = self.db.iter::<EventByKeySchema>()?;
         iter.seek_to_first();
         Ok(Box::new(iter.map(|res| {
             let ((event_key, seq_num), (txn_version, idx)) = res.unwrap();
@@ -283,7 +378,7 @@ impl DBTailer {
             .get_account_transaction_version_iter(address, start_seq_num, limit, ledger_version)?
             .map(|result| {
                 let (_seq_num, txn_version) = result?;
-                self.main_db_reader.get_transaction_with_proof(
+                self.main_db_reader.get_transaction_by_version(
                     txn_version,
                     ledger_version,
                     include_events,

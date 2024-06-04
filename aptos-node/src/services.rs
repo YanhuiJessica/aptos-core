@@ -15,7 +15,7 @@ use aptos_db_indexer::indexer_reader::IndexerReaders;
 use aptos_event_notifications::{DbBackedOnChainConfig, ReconfigNotificationListener};
 use aptos_indexer_grpc_fullnode::runtime::bootstrap as bootstrap_indexer_grpc;
 use aptos_indexer_grpc_table_info::runtime::{
-    bootstrap as bootstrap_indexer_table_info, bootstrap_db_tailer,
+    bootstrap as bootstrap_indexer_table_info, bootstrap_internal_indexer_db,
 };
 use aptos_logger::{debug, telemetry_log_writer::TelemetryLog, LoggerFilterUpdater};
 use aptos_mempool::{network::MempoolSyncMsg, MempoolClientRequest, QuorumStoreRequest};
@@ -29,7 +29,7 @@ use aptos_peer_monitoring_service_server::{
 use aptos_peer_monitoring_service_types::PeerMonitoringServiceMessage;
 use aptos_storage_interface::{DbReader, DbReaderWriter};
 use aptos_time_service::TimeService;
-use aptos_types::{chain_id::ChainId, indexer::db_tailer_reader::IndexerReader};
+use aptos_types::{chain_id::ChainId, indexer::indexer_db_reader::IndexerReader};
 use aptos_validator_transaction_pool::VTxnPoolState;
 use futures::channel::{mpsc, mpsc::Sender};
 use std::{sync::Arc, time::Instant};
@@ -66,9 +66,9 @@ pub fn bootstrap_api_and_indexer(
         None => (None, None),
     };
 
-    let (db_tailer_runtime, txn_event_reader) =
-        match bootstrap_db_tailer(node_config, db_rw.clone()) {
-            Some((runtime, db_tailer)) => (Some(runtime), Some(db_tailer)),
+    let (db_indexer_runtime, txn_event_reader) =
+        match bootstrap_internal_indexer_db(node_config, db_rw.clone()) {
+            Some((runtime, db_indexer)) => (Some(runtime), Some(db_indexer)),
             None => (None, None),
         };
 
@@ -115,7 +115,7 @@ pub fn bootstrap_api_and_indexer(
         indexer_table_info_runtime,
         indexer_runtime,
         indexer_grpc,
-        db_tailer_runtime,
+        db_indexer_runtime,
     ))
 }
 
