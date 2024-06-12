@@ -48,28 +48,49 @@ impl PeerLocationUpdater {
     }
 }
 
+
+
 pub async fn query_peer_locations(
     client: &BigQueryClient,
 ) -> anyhow::Result<HashMap<PeerId, PeerLocation>> {
     let req = QueryRequest::new("
-        SELECT
-            sq.peer_id,
-            sq.country,
-            sq.region,
-            '1985-04-12T23:20:50.52Z' as geo_updated_at
-        FROM (
+        WITH latest_epochs AS (
             SELECT
-            tm.peer_id,
-            tm.epoch,
-            ROW_NUMBER() OVER (PARTITION BY tm.peer_id ORDER BY tm.epoch DESC) AS row_number,
-            tm.country,
-            tm.region
-            FROM
-            `node-telemetry.aptos_node_telemetry.custom_events_mainnet_telemetry_rollup_metrics` tm) sq
-        WHERE
-            sq.row_number = 1
-        LIMIT
-            1000
+                chain_id,
+                MAX(epoch) AS max_epoch
+            FROM `node-telemetry.aptos_data.validator_perf`
+            GROUP BY chain_id
+        ),
+        latest_validator_pool AS (
+            SELECT
+                chain_id,
+                CONCAT('0x', LPAD(LTRIM(peer_id, '0x'), 64, '0')) as peer_id
+            FROM `node-telemetry.aptos_data.validator_perf`
+            JOIN latest_epochs USING (chain_id)
+            WHERE epoch = max_epoch
+        ),
+        latest_node_ips AS (
+            SELECT DISTINCT
+                n.chain_id,
+                n.epoch,
+                element.value as ip,
+                CONCAT('0x', LPAD(LTRIM(n.peer_id, '0x'), 64, '0')) as peer_id
+            FROM `analytics-test-345723.aptos_node_telemetry.custom_events` n
+            JOIN latest_epochs le ON n.chain_id = CAST(le.chain_id AS STRING)
+            CROSS JOIN UNNEST(event_params) as element
+            WHERE
+                element.key = 'IP_ADDRESS'
+                AND n.epoch = le.max_epoch
+        )
+        SELECT
+            a.peer_id,
+            ip,
+            ipg.country,
+            ipg.region,
+            ipg.update_timestamp
+        FROM latest_node_ips a
+        LEFT JOIN `node-telemetry.aptos_node_telemetry.ip_geo_latest` ipg
+        USING(ip)
     ");
     let req = QueryRequest {
         timeout_ms: Some(10000),
@@ -95,7 +116,7 @@ pub async fn query_peer_locations(
                 Ok(peer_id) => {
                     let location = PeerLocation {
                         peer_id,
-                        geo_updated_at: res.get_string_by_name("geo_updated_at")?,
+                        geo_updated_at: res.get_string_by_name("update_timestamp")?,
                         country: res.get_string_by_name("country")?,
                         region: res.get_string_by_name("region")?,
                     };
