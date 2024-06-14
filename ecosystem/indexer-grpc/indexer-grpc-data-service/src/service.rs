@@ -42,6 +42,7 @@ use tokio::sync::mpsc::{channel, error::SendTimeoutError};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
+use transaction_filter::{BooleanTransactionFilter, Filterable};
 use uuid::Uuid;
 
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<TransactionsResponse, Status>> + Send>>;
@@ -77,7 +78,7 @@ pub struct RawDataServerWrapper {
     pub redis_client: Arc<redis::Client>,
     pub file_store_config: IndexerGrpcFileStoreConfig,
     pub data_service_response_channel_size: usize,
-    pub sender_addresses_to_ignore: HashSet<String>,
+    pub txns_to_strip_filter: BooleanTransactionFilter,
     pub cache_storage_format: StorageFormat,
     in_memory_cache: Arc<InMemoryCache>,
 }
@@ -87,7 +88,7 @@ impl RawDataServerWrapper {
         redis_address: RedisUrl,
         file_store_config: IndexerGrpcFileStoreConfig,
         data_service_response_channel_size: usize,
-        sender_addresses_to_ignore: HashSet<String>,
+        txns_to_strip_filter: BooleanTransactionFilter,
         cache_storage_format: StorageFormat,
         in_memory_cache: Arc<InMemoryCache>,
     ) -> anyhow::Result<Self> {
@@ -99,7 +100,7 @@ impl RawDataServerWrapper {
             ),
             file_store_config,
             data_service_response_channel_size,
-            sender_addresses_to_ignore,
+            txns_to_strip_filter,
             cache_storage_format,
             in_memory_cache,
         })
@@ -175,7 +176,7 @@ impl RawData for RawDataServerWrapper {
         let redis_client = self.redis_client.clone();
         let cache_storage_format = self.cache_storage_format;
         let request_metadata = Arc::new(request_metadata);
-        let sender_addresses_to_ignore = self.sender_addresses_to_ignore.clone();
+        let txns_to_strip_filter = self.txns_to_strip_filter.clone();
         let in_memory_cache = self.in_memory_cache.clone();
         tokio::spawn({
             let request_metadata = request_metadata.clone();
@@ -187,7 +188,7 @@ impl RawData for RawDataServerWrapper {
                     request_metadata,
                     transactions_count,
                     tx,
-                    sender_addresses_to_ignore,
+                    txns_to_strip_filter,
                     current_version,
                     in_memory_cache,
                 )
@@ -375,7 +376,7 @@ async fn data_fetcher_task(
     request_metadata: Arc<IndexerGrpcRequestMetadata>,
     transactions_count: Option<u64>,
     tx: tokio::sync::mpsc::Sender<Result<TransactionsResponse, Status>>,
-    sender_addresses_to_ignore: HashSet<String>,
+    txns_to_strip_filter: BooleanTransactionFilter,
     mut current_version: u64,
     in_memory_cache: Arc<InMemoryCache>,
 ) {
@@ -513,7 +514,7 @@ async fn data_fetcher_task(
         let resp_items = get_transactions_responses_builder(
             transaction_data,
             chain_id as u32,
-            &sender_addresses_to_ignore,
+            &txns_to_strip_filter,
         );
         let data_latency_in_secs = resp_items
             .last()
@@ -657,11 +658,10 @@ fn ensure_sequential_transactions(mut batches: Vec<Vec<Transaction>>) -> Vec<Tra
 fn get_transactions_responses_builder(
     transactions: Vec<Transaction>,
     chain_id: u32,
-    sender_addresses_to_ignore: &HashSet<String>,
+    txns_to_strip_filter: &BooleanTransactionFilter,
 ) -> Vec<TransactionsResponse> {
-    let filtered_transactions =
-        filter_transactions_for_sender_addresses(transactions, sender_addresses_to_ignore);
-    let chunks = chunk_transactions(filtered_transactions, MESSAGE_SIZE_LIMIT);
+    let stripped_transactions = strip_transactions(transactions, txns_to_strip_filter);
+    let chunks = chunk_transactions(stripped_transactions, MESSAGE_SIZE_LIMIT);
     chunks
         .into_iter()
         .map(|chunk| TransactionsResponse {
@@ -937,21 +937,29 @@ async fn channel_send_multiple_with_timeout(
     Ok(())
 }
 
-fn filter_transactions_for_sender_addresses(
+/// This function strips transactions that match the given filter. Stripping means we
+/// remove the payload, signature, events, and writesets. Note, the filter can be
+/// composed of many conditions, see `BooleanTransactionFilter` for more.
+fn strip_transactions(
     transactions: Vec<Transaction>,
-    sender_addresses_to_ignore: &HashSet<String>,
+    txns_to_strip_filter: &BooleanTransactionFilter,
 ) -> Vec<Transaction> {
     transactions
         .into_iter()
         .map(|mut txn| {
-            if let Some(TxnData::User(user_transaction)) = txn.txn_data.as_mut() {
-                if let Some(utr) = user_transaction.request.as_mut() {
-                    if sender_addresses_to_ignore.contains(&utr.sender) {
+            // Note: `is_allowed` means the txn is matches the filter, in which case
+            // we strip it.
+            if txns_to_strip_filter.is_allowed(&txn) {
+                // TODO: transaction-filter needs to be moved to aptos-core, see https://aptos-org.slack.com/archives/C0468USBLQJ/p1718368277898979?thread_ts=1718356561.304619&cid=C0468USBLQJ
+                if let Some(info) = txn.info.as_mut() {
+                    info.changes = vec![];
+                }
+                if let Some(TxnData::User(user_transaction)) = txn.txn_data.as_mut() {
+                    user_transaction.events = vec![];
+                    if let Some(utr) = user_transaction.request.as_mut() {
                         // Wipe the payload and signature.
                         utr.payload = None;
                         utr.signature = None;
-                        user_transaction.events = vec![];
-                        txn.info.as_mut().unwrap().changes = vec![];
                     }
                 }
             }
@@ -962,7 +970,7 @@ fn filter_transactions_for_sender_addresses(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_sequential_transactions, filter_transactions_for_sender_addresses};
+    use super::ensure_sequential_transactions;
     use aptos_protos::transaction::v1::{
         transaction::TxnData, Event, Signature, Transaction, TransactionInfo, TransactionPayload,
         UserTransaction, UserTransactionRequest, WriteSetChange,
@@ -1014,6 +1022,7 @@ mod tests {
         assert_eq!(transactions1.last().unwrap().version, 11);
     }
 
+    // TODO: Adapt this for strip_transactions instead.
     #[test]
     fn test_transactions_are_filter_correctly() {
         let sender_address = "0x1234".to_string();
