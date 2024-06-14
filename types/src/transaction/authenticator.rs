@@ -583,7 +583,12 @@ impl AccountAuthenticator {
 
     /// Return an authentication key derived from `self`'s public key and scheme id
     pub fn authentication_key(&self) -> AuthenticationKey {
-        AuthenticationKey::from_preimage(self.public_key_bytes(), self.scheme())
+        if let Self::SingleKey { authenticator: SingleKeyAuthenticator {public_key: AnyPublicKey::None, signature: _ } } = self {
+            AuthenticationKey::zero()
+        }
+        else {
+            AuthenticationKey::from_preimage(self.public_key_bytes(), self.scheme())
+        }
     }
 
     /// Return the number of signatures included in this account authenticator.
@@ -1067,6 +1072,7 @@ pub enum AnyPublicKey {
     Keyless {
         public_key: KeylessPublicKey,
     },
+    None,
 }
 
 impl AnyPublicKey {
@@ -1085,6 +1091,8 @@ impl AnyPublicKey {
     pub fn keyless(public_key: KeylessPublicKey) -> Self {
         Self::Keyless { public_key }
     }
+
+    pub fn none() -> Self { Self::None }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         bcs::to_bytes(self).expect("Only unhandleable errors happen here.")
