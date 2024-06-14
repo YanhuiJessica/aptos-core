@@ -12,7 +12,7 @@ use aptos_types::{
 use sender_aware::SenderAwareShuffler;
 use std::sync::Arc;
 
-mod fairness;
+mod deprecated_fairness;
 mod sender_aware;
 
 /// Interface to shuffle transactions
@@ -48,7 +48,7 @@ pub fn create_transaction_shuffler(
             );
             Arc::new(SenderAwareShuffler::new(conflict_window_size as usize))
         },
-        TransactionShufflerType::Fairness {
+        TransactionShufflerType::DeprecatedFairness {
             sender_conflict_window_size,
             module_conflict_window_size,
             entry_fun_conflict_window_size,
@@ -59,7 +59,7 @@ pub fn create_transaction_shuffler(
                 module_conflict_window_size,
                 entry_fun_conflict_window_size
             );
-            Arc::new(fairness::FairnessShuffler {
+            Arc::new(deprecated_fairness::FairnessShuffler {
                 sender_conflict_window_size: sender_conflict_window_size as usize,
                 module_conflict_window_size: module_conflict_window_size as usize,
                 entry_fun_conflict_window_size: entry_fun_conflict_window_size as usize,
