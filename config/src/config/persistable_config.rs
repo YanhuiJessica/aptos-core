@@ -22,7 +22,7 @@ pub trait PersistableConfig: Serialize + DeserializeOwned {
     /// Save the config to disk at the given output path
     fn save_config<P: AsRef<Path>>(&self, output_file: P) -> Result<(), Error> {
         // Serialize the config to a string
-        let serialized_config = serde_yaml::to_vec(&self)
+        let serialized_config = serde_yaml_to_vec(&self)
             .map_err(|e| Error::Yaml(output_file.as_ref().to_str().unwrap().to_string(), e))?;
 
         Self::write_file(serialized_config, output_file)
@@ -58,3 +58,19 @@ pub trait PersistableConfig: Serialize + DeserializeOwned {
 // We only implement PersistableConfig for the configs that should be read/written to disk
 impl PersistableConfig for NodeConfig {}
 impl PersistableConfig for SafetyRulesConfig {}
+
+/// Serialize the given data structure as a YAML byte vector.
+///
+/// Serialization can fail if `T`'s implementation of `Serialize` decides to
+/// return an error.
+///
+/// serde_yaml 0.9.x doesn't have this function so we reimplement it here as it existed
+/// in serde_yaml 0.8.x.
+pub fn serde_yaml_to_vec<T: ?Sized>(value: &T) -> serde_yaml::Result<Vec<u8>>
+where
+    T: serde::ser::Serialize,
+{
+    let mut vec = Vec::with_capacity(128);
+    serde_yaml::to_writer(&mut vec, value)?;
+    Ok(vec)
+}
