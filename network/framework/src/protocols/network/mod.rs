@@ -14,20 +14,20 @@ use crate::{
     transport::ConnectionMetadata,
     ProtocolId,
 };
-use aptos_channels::{aptos_channel, message_queues::QueueStyle};
+use aptos_channels::{aptos_channel, aptos_channel::Sender, message_queues::QueueStyle};
 use aptos_logger::prelude::*;
 use aptos_short_hex_str::AsShortHexStr;
-use aptos_types::{network_address::NetworkAddress, PeerId};
+use aptos_types::{account_address::AccountAddress, network_address::NetworkAddress, PeerId};
 use bytes::Bytes;
 use futures::{
     channel::oneshot,
     stream::{FusedStream, Map, Select, Stream, StreamExt},
     task::{Context, Poll},
 };
-use futures_util::FutureExt;
 use pin_project::pin_project;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{cmp::min, fmt::Debug, marker::PhantomData, pin::Pin, time::Duration};
+use tokio::task::JoinError;
 
 pub trait Message: DeserializeOwned + Serialize {}
 impl<T: DeserializeOwned + Serialize> Message for T {}
@@ -172,6 +172,7 @@ pub trait NewNetworkEvents {
         peer_mgr_notifs_rx: aptos_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
         connection_notifs_rx: aptos_channel::Receiver<PeerId, ConnectionNotification>,
         max_parallel_deserialization_tasks: Option<usize>,
+        allow_out_of_order_delivery: bool,
     ) -> Self;
 }
 
@@ -180,46 +181,54 @@ impl<TMessage: Message + Send + 'static> NewNetworkEvents for NetworkEvents<TMes
         peer_mgr_notifs_rx: aptos_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
         connection_notifs_rx: aptos_channel::Receiver<PeerId, ConnectionNotification>,
         max_parallel_deserialization_tasks: Option<usize>,
+        allow_out_of_order_delivery: bool,
     ) -> Self {
-        // Create a channel for deserialized messages
+        // Determine the number of parallel deserialization tasks to use
+        let max_parallel_deserialization_tasks = max_parallel_deserialization_tasks.unwrap_or(1);
+
+        // Create a channel for the deserialized messages
         let (deserialized_message_sender, deserialized_message_receiver) = aptos_channel::new(
             QueueStyle::FIFO,
             MAX_DESERIALIZATION_QUEUE_SIZE_PER_PEER,
             None,
         );
 
-        // Deserialize the peer manager notifications in parallel (for each
-        // network application) and send them to the receiver. Note: this
-        // may cause out of order message delivery, but applications
-        // should already be handling this.
+        // Deserialize the peer manager notifications in parallel and send
+        // them to the receiver. Note: if `allow_out_of_order_delivery` is
+        // true, this will cause out of order message delivery. However,
+        // most applications should already be handling this.
         tokio::spawn(async move {
-            peer_mgr_notifs_rx
-                .for_each_concurrent(
-                    max_parallel_deserialization_tasks,
-                    move |peer_manager_notification| {
-                        // Get the peer ID for the notification
-                        let deserialized_message_sender = deserialized_message_sender.clone();
-                        let peer_id_for_notification = peer_manager_notification.get_peer_id();
+            // Create the message deserialization task
+            let deserialization_task = peer_mgr_notifs_rx.map(move |peer_manager_notification| {
+                // Spawn a new blocking task to deserialize the message
+                let deserialized_message_sender = deserialized_message_sender.clone();
+                tokio::task::spawn_blocking(move || {
+                    (
+                        peer_manager_notification.get_peer_id(),
+                        deserialized_message_sender,
+                        peer_mgr_notif_to_event(peer_manager_notification),
+                    )
+                })
+            });
 
-                        // Spawn a new blocking task to deserialize the message
-                        tokio::task::spawn_blocking(move || {
-                            if let Some(deserialized_message) =
-                                peer_mgr_notif_to_event(peer_manager_notification)
-                            {
-                                if let Err(error) = deserialized_message_sender
-                                    .push(peer_id_for_notification, deserialized_message)
-                                {
-                                    warn!(
-                                        "Failed to send deserialized message to receiver: {:?}",
-                                        error
-                                    );
-                                }
-                            }
-                        })
-                        .map(|_| ())
-                    },
-                )
-                .await
+            // Execute the deserialization task with buffering based on delivery order
+            if allow_out_of_order_delivery {
+                deserialization_task
+                    .buffer_unordered(max_parallel_deserialization_tasks)
+                    .map(|deserialization_result| {
+                        process_deserialized_message(deserialization_result)
+                    })
+                    .collect::<()>()
+                    .await;
+            } else {
+                deserialization_task
+                    .buffered(max_parallel_deserialization_tasks)
+                    .map(|deserialization_result| {
+                        process_deserialized_message(deserialization_result)
+                    })
+                    .collect::<()>()
+                    .await;
+            }
         });
 
         // Process the control messages
@@ -261,6 +270,32 @@ fn peer_mgr_notif_to_event<TMessage: Message>(
         PeerManagerNotification::RecvMessage(peer_id, request) => {
             request_to_network_event(peer_id, &request).map(|msg| Event::Message(peer_id, msg))
         },
+    }
+}
+
+/// Processes the deserialized message and sends it to the receiver
+fn process_deserialized_message<TMessage: Message + Send + 'static>(
+    deserialization_result: Result<
+        (
+            AccountAddress,
+            Sender<AccountAddress, Event<TMessage>>,
+            Option<Event<TMessage>>,
+        ),
+        JoinError,
+    >,
+) {
+    if let Ok((peer_id_for_notification, deserialized_message_sender, Some(deserialized_message))) =
+        deserialization_result
+    {
+        // Send the deserialized message to the receiver
+        if let Err(error) =
+            deserialized_message_sender.push(peer_id_for_notification, deserialized_message)
+        {
+            warn!(
+                "Failed to send deserialized message to receiver: {:?}",
+                error
+            );
+        }
     }
 }
 
